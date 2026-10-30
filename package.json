@@ -7,7 +7,7 @@
     "setup:all": "npm install && npm run setup:tools",
     "setup:tools": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/setup-tools.ps1",
     "dev": "concurrently \"npm run dev:api\" \"npm run dev:web\"",
-    "dev:api": "node server/index.js",
+    "dev:api": "node --watch server/index.js",
     "dev:web": "vite --host 0.0.0.0",
     "build": "vite build",
     "start": "node server/index.js"

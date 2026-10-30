@@ -13,60 +13,122 @@ const DEFAULT_AI_BLEND = 0.3;
 export async function processMedia({
   inputPath,
   originalName,
-  mediaType,
+  mediaType = 'image',
   presetKey,
+  model,
+  blendStrength,
   jobsDir,
   jobId,
-  onProgress = () => {}
+  onProgress = () => { }
 }) {
   const preset = PRESETS[presetKey];
   const jobDir = path.join(jobsDir, jobId);
   fs.mkdirSync(jobDir, { recursive: true });
 
-  if (mediaType === 'image') {
-    return processImage({ inputPath, originalName, preset, jobDir, onProgress });
-  }
+  const customModel = typeof model === 'string' && model ? model : undefined;
+  const customBlend = typeof blendStrength === 'number' && !Number.isNaN(blendStrength) ? Math.min(Math.max(blendStrength, 0), 1) : undefined;
 
-  return processVideo({ inputPath, originalName, preset, jobDir, onProgress });
+  return processImage({ inputPath, originalName, preset, model: customModel, blendStrength: customBlend, jobDir, onProgress });
 }
 
-async function processImage({ inputPath, originalName, preset, jobDir, onProgress }) {
-  const { realEsrganBin, ffmpegBin, modelName, modelScale, modelPathArgs, modelsDir } = getProcessorConfig();
+async function processImage({ inputPath, originalName, preset, model, blendStrength, jobDir, onProgress }) {
+  const { realEsrganBin, ffmpegBin, modelName: defaultModelName, modelScale, modelPathArgs, modelsDir } = getProcessorConfig();
+  const selectedModelName = model || defaultModelName;
+  const blend = blendStrength !== undefined ? blendStrength : readAiBlend();
   const baseName = safeBaseName(originalName);
+  const normalizedInput = path.join(jobDir, 'normalized-input.png');
   const aiOutput = path.join(jobDir, 'ai-upscaled.png');
   const finalOutput = path.join(jobDir, `${baseName}-${preset.key}-upscaled.png`);
 
-  onProgress('Running Real-ESRGAN');
-  assertRealEsrganModel({ modelsDir, modelName });
-  await run(realEsrganBin, [
-    '-i',
-    inputPath,
-    '-o',
-    aiOutput,
-    '-n',
-    modelName,
-    ...modelPathArgs,
-    '-s',
-    modelScale,
-    '-f',
-    'png'
-  ]);
+  // Step 1: Normalize orientation and scale input to match target resolution
+  onProgress('Preparing image geometry', 8);
+  const targetLongEdge = preset.longEdge;
+  const maxAiInputLongEdge = Math.round(targetLongEdge / Number(modelScale || 4));
 
-  onProgress(`Blending natural detail for ${preset.label}`);
   await run(ffmpegBin, [
     '-y',
     '-i',
     inputPath,
+    '-vf',
+    `scale='if(gt(max(iw,ih),${maxAiInputLongEdge}),if(gte(iw,ih),${maxAiInputLongEdge},-2),iw)':'if(gt(max(iw,ih),${maxAiInputLongEdge}),if(gte(iw,ih),-2,${maxAiInputLongEdge}),ih)':flags=lanczos`,
+    '-compression_level',
+    '1',
+    '-frames:v',
+    '1',
+    '-update',
+    '1',
+    normalizedInput
+  ]);
+
+  // Step 2: Feed the normalized image to Real-ESRGAN with granular progressive feedback
+  onProgress(`Running Real-ESRGAN (${selectedModelName})`, 15);
+  assertRealEsrganModel({ modelsDir, modelName: selectedModelName });
+
+  let simulatedProgress = 15;
+  const progressTimer = setInterval(() => {
+    if (simulatedProgress < 74) {
+      simulatedProgress += simulatedProgress < 40 ? 5 : simulatedProgress < 60 ? 4 : 2;
+      onProgress(`Vulkan AI Super-Resolution (${selectedModelName})`, simulatedProgress);
+    }
+  }, 350);
+
+  try {
+    await run(realEsrganBin, [
+      '-i',
+      normalizedInput,
+      '-o',
+      aiOutput,
+      '-n',
+      selectedModelName,
+      ...modelPathArgs,
+      '-s',
+      modelScale,
+      ...gpuArgs(),
+      '-t',
+      '400',
+      '-j',
+      '1:2:2',
+      '-f',
+      'png'
+    ], (stderrChunk) => {
+      // Parse Real-ESRGAN verbose progress if reported
+      const match = stderrChunk.match(/(\d+(?:[.,]\d+)?)%/);
+      if (match) {
+        const rawPct = parseFloat(match[1].replace(',', '.'));
+        const mapped = Math.round(15 + (rawPct / 100) * 59);
+        if (mapped > simulatedProgress && mapped <= 74) {
+          simulatedProgress = mapped;
+          onProgress(`Vulkan AI Super-Resolution (${selectedModelName})`, simulatedProgress);
+        }
+      }
+    });
+  } finally {
+    clearInterval(progressTimer);
+  }
+
+  // Step 3: Blend original and AI output
+  onProgress(`Applying natural detail blend (${Math.round(blend * 100)}%)`, 78);
+  await run(ffmpegBin, [
+    '-y',
+    '-i',
+    normalizedInput,
     '-i',
     aiOutput,
     '-filter_complex',
-    naturalBlendFilter(preset.longEdge, readAiBlend()),
+    naturalBlendFilter(preset.longEdge, blend),
     '-map',
     '[out]',
+    '-compression_level',
+    '1',
     '-frames:v',
+    '1',
+    '-update',
     '1',
     finalOutput
   ]);
+
+  onProgress('Finalizing high-res master', 95);
+  onProgress('Ready for download', 100);
 
   return {
     outputPath: finalOutput,
@@ -74,109 +136,7 @@ async function processImage({ inputPath, originalName, preset, jobDir, onProgres
   };
 }
 
-async function processVideo({ inputPath, originalName, preset, jobDir, onProgress }) {
-  const { realEsrganBin, ffmpegBin, modelName, modelScale, modelPathArgs, modelsDir } = getProcessorConfig();
-  const baseName = safeBaseName(originalName);
-  const framesDir = path.join(jobDir, 'frames');
-  const upscaledFramesDir = path.join(jobDir, 'upscaled-frames');
-  const finalOutput = path.join(jobDir, `${baseName}-${preset.key}-upscaled.mp4`);
-  const fps = await readFrameRate(inputPath);
-
-  fs.mkdirSync(framesDir, { recursive: true });
-  fs.mkdirSync(upscaledFramesDir, { recursive: true });
-
-  onProgress('Extracting video frames');
-  await run(ffmpegBin, [
-    '-y',
-    '-i',
-    inputPath,
-    '-vsync',
-    '0',
-    path.join(framesDir, 'frame_%08d.png')
-  ]);
-
-  onProgress('Running Real-ESRGAN on frames');
-  assertRealEsrganModel({ modelsDir, modelName });
-  await run(realEsrganBin, [
-    '-i',
-    framesDir,
-    '-o',
-    upscaledFramesDir,
-    '-n',
-    modelName,
-    ...modelPathArgs,
-    '-s',
-    modelScale,
-    '-f',
-    'png'
-  ]);
-
-  onProgress(`Rebuilding natural ${preset.label} video`);
-  await run(ffmpegBin, [
-    '-y',
-    '-framerate',
-    fps,
-    '-start_number',
-    '1',
-    '-i',
-    path.join(upscaledFramesDir, 'frame_%08d.png'),
-    '-i',
-    inputPath,
-    '-filter_complex',
-    naturalVideoFilter(preset.longEdge, readAiBlend()),
-    '-map',
-    '[outv]',
-    '-map',
-    '1:a?',
-    '-c:v',
-    'libx264',
-    '-preset',
-    'slow',
-    '-crf',
-    '16',
-    '-pix_fmt',
-    'yuv420p',
-    '-c:a',
-    'aac',
-    '-b:a',
-    '192k',
-    '-movflags',
-    '+faststart',
-    '-shortest',
-    finalOutput
-  ]);
-
-  return {
-    outputPath: finalOutput,
-    downloadName: `${baseName}-${preset.key}-upscaled.mp4`
-  };
-}
-
-async function readFrameRate(inputPath) {
-  try {
-    const { ffprobeBin } = getProcessorConfig();
-    const { stdout } = await run(ffprobeBin, [
-      '-v',
-      'error',
-      '-select_streams',
-      'v:0',
-      '-show_entries',
-      'stream=r_frame_rate',
-      '-of',
-      'default=noprint_wrappers=1:nokey=1',
-      inputPath
-    ]);
-
-    const frameRate = stdout.trim();
-    if (frameRate && frameRate !== '0/0') return frameRate;
-  } catch {
-    return '30';
-  }
-
-  return '30';
-}
-
-function getProcessorConfig() {
+export function getProcessorConfig() {
   const modelsDir = process.env.REAL_ESRGAN_MODELS_DIR;
   const localRealEsrganBin = path.join(
     process.cwd(),
@@ -243,21 +203,14 @@ function naturalBlendFilter(longEdge, aiBlend) {
   const originalBlend = roundBlend(1 - aiBlend);
   const refinedBlend = roundBlend(aiBlend);
 
+  if (refinedBlend >= 0.99) {
+    return `${scaleFilter(longEdge, '[1:v]')},format=rgb24[out]`;
+  }
+
   return [
     `${scaleFilter(longEdge, '[0:v]')},format=rgba[base]`,
     `${scaleFilter(longEdge, '[1:v]')},format=rgba[ai]`,
     `[base][ai]blend=all_expr='A*${originalBlend}+B*${refinedBlend}',format=rgb24[out]`
-  ].join(';');
-}
-
-function naturalVideoFilter(longEdge, aiBlend) {
-  const originalBlend = roundBlend(1 - aiBlend);
-  const refinedBlend = roundBlend(aiBlend);
-
-  return [
-    `${scaleFilter(longEdge, '[1:v]')},format=rgba[base]`,
-    `${scaleFilter(longEdge, '[0:v]')},format=rgba[ai]`,
-    `[base][ai]blend=all_expr='A*${originalBlend}+B*${refinedBlend}',format=yuv420p[outv]`
   ].join(';');
 }
 
@@ -281,7 +234,13 @@ function safeBaseName(fileName) {
   return clean || 'media';
 }
 
-function run(command, args) {
+// Dedicated GPU pinning (defaults to GPU 0: NVIDIA GeForce RTX 2060)
+function gpuArgs() {
+  const id = (process.env.REAL_ESRGAN_GPU_ID || '0').trim();
+  return /^\d+$/.test(id) ? ['-g', id] : ['-g', '0'];
+}
+
+export function run(command, args, onStderrData = null) {
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, { windowsHide: true });
     let stdout = '';
@@ -292,7 +251,15 @@ function run(command, args) {
     });
 
     child.stderr.on('data', (chunk) => {
-      stderr += chunk.toString();
+      const text = chunk.toString();
+      stderr += text;
+      if (typeof onStderrData === 'function') {
+        try {
+          onStderrData(text);
+        } catch {
+          // Ignore
+        }
+      }
     });
 
     child.on('error', (error) => {

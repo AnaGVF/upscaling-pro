@@ -1,3 +1,4 @@
+import { spawn } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -6,7 +7,7 @@ import cors from 'cors';
 import dotenv from 'dotenv';
 import express from 'express';
 import multer from 'multer';
-import { PRESETS, processMedia } from './upscaler.js';
+import { PRESETS, getProcessorConfig, processMedia, run } from './upscaler.js';
 
 dotenv.config();
 
@@ -51,15 +52,10 @@ app.get('/api/health', (_request, response) => {
 });
 
 app.post('/api/upscale', upload.single('media'), (request, response) => {
-  const { mediaType, preset } = request.body;
+  const { preset, model, blendStrength } = request.body;
 
   if (!request.file) {
-    response.status(400).json({ error: 'Upload an image or video file.' });
-    return;
-  }
-
-  if (!['image', 'video'].includes(mediaType)) {
-    response.status(400).json({ error: 'Choose either image or video.' });
+    response.status(400).json({ error: 'Upload an image file.' });
     return;
   }
 
@@ -68,18 +64,25 @@ app.post('/api/upscale', upload.single('media'), (request, response) => {
     return;
   }
 
-  if (!matchesSelectedMediaType(request.file, mediaType)) {
-    response.status(400).json({ error: `The uploaded file does not look like a ${mediaType}.` });
+  if (!matchesSelectedMediaType(request.file)) {
+    response.status(400).json({ error: 'The uploaded file does not look like a supported image.' });
     return;
   }
+
+  const validModels = ['realesrgan-x4plus', 'realesrgan-x4plus-anime'];
+  const selectedModel = validModels.includes(model) ? model : undefined;
+  const parsedBlend = blendStrength !== undefined ? parseFloat(blendStrength) : undefined;
 
   const jobId = crypto.randomUUID();
   const job = {
     id: jobId,
     status: 'queued',
     message: 'Queued',
-    mediaType,
+    progress: 0,
+    mediaType: 'image',
     preset,
+    model: selectedModel,
+    blendStrength: parsedBlend,
     originalName: request.file.originalname,
     createdAt: new Date().toISOString()
   };
@@ -89,20 +92,29 @@ app.post('/api/upscale', upload.single('media'), (request, response) => {
 
   queueMicrotask(async () => {
     try {
-      updateJob(jobId, { status: 'processing', message: 'Preparing media' });
+      updateJob(jobId, { status: 'processing', message: 'Preparing image', progress: 5 });
       const result = await processMedia({
         inputPath: request.file.path,
         originalName: request.file.originalname,
-        mediaType,
+        mediaType: 'image',
         presetKey: preset,
+        model: selectedModel,
+        blendStrength: parsedBlend,
         jobsDir,
         jobId,
-        onProgress: (message) => updateJob(jobId, { message })
+        onProgress: (message, progress) => {
+          const patch = { message };
+          if (typeof progress === 'number' && !Number.isNaN(progress)) {
+            patch.progress = Math.min(Math.max(Math.round(progress), 0), 100);
+          }
+          updateJob(jobId, patch);
+        }
       });
 
       updateJob(jobId, {
         status: 'done',
         message: 'Ready to download',
+        progress: 100,
         outputPath: result.outputPath,
         downloadName: result.downloadName,
         downloadUrl: `/api/download/${jobId}`
@@ -127,7 +139,7 @@ app.get('/api/jobs/:jobId', (request, response) => {
   response.json(publicJob(job));
 });
 
-app.get('/api/download/:jobId', (request, response) => {
+app.get('/api/download/:jobId', async (request, response) => {
   const job = jobs.get(request.params.jobId);
 
   if (!job) {
@@ -140,7 +152,47 @@ app.get('/api/download/:jobId', (request, response) => {
     return;
   }
 
-  response.download(job.outputPath, job.downloadName);
+  const sharpness = Math.min(Math.max(Number(request.query.sharpness || 0), 0), 100);
+
+  // If no post-processing sharpness requested, serve direct file
+  if (sharpness === 0) {
+    response.download(job.outputPath, job.downloadName);
+    return;
+  }
+
+  try {
+    const jobDir = path.dirname(job.outputPath);
+    const ext = path.extname(job.downloadName) || '.png';
+    const base = path.basename(job.downloadName, ext);
+    const sharpenedName = `${base}-sharp-${sharpness}${ext}`;
+    const sharpenedPath = path.join(jobDir, sharpenedName);
+
+    // If already generated and cached on disk, download directly
+    if (fs.existsSync(sharpenedPath)) {
+      response.download(sharpenedPath, sharpenedName);
+      return;
+    }
+
+    const { ffmpegBin } = getProcessorConfig();
+    const amount = (0.5 + (sharpness / 100) * 2.0).toFixed(2);
+    const contrast = (1 + (sharpness / 100) * 0.12).toFixed(3);
+    const brightness = ((sharpness / 100) * 0.02).toFixed(3);
+    const filterComplex = `unsharp=5:5:${amount}:5:5:0.0,eq=contrast=${contrast}:brightness=${brightness}`;
+
+    await run(ffmpegBin, [
+      '-y',
+      '-i', job.outputPath,
+      '-vf', filterComplex,
+      '-frames:v', '1',
+      '-update', '1',
+      sharpenedPath
+    ]);
+
+    response.download(sharpenedPath, sharpenedName);
+  } catch (err) {
+    console.error('Error generating sharpened output:', err);
+    response.download(job.outputPath, job.downloadName);
+  }
 });
 
 if (fs.existsSync(distDir)) {
@@ -174,23 +226,23 @@ function publicJob(job) {
     id: job.id,
     status: job.status,
     message: job.message,
+    progress: job.progress !== undefined ? job.progress : (job.status === 'done' ? 100 : 0),
     mediaType: job.mediaType,
     preset: job.preset,
     originalName: job.originalName,
+    downloadName: job.downloadName,
     downloadUrl: job.downloadUrl,
     error: job.error
   };
 }
 
-function matchesSelectedMediaType(file, mediaType) {
+function matchesSelectedMediaType(file) {
   const mimeType = file.mimetype || '';
-  if (mimeType.startsWith(`${mediaType}/`)) return true;
+  if (mimeType.startsWith('image/')) return true;
 
   const extension = path.extname(file.originalname || '').toLowerCase();
   const imageExtensions = new Set(['.jpg', '.jpeg', '.png', '.webp', '.tif', '.tiff']);
-  const videoExtensions = new Set(['.mp4', '.mov', '.m4v', '.webm', '.mkv', '.avi']);
-
-  return mediaType === 'image' ? imageExtensions.has(extension) : videoExtensions.has(extension);
+  return imageExtensions.has(extension);
 }
 
 function readableError(error) {
