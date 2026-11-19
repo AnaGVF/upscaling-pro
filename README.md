@@ -22,7 +22,7 @@
 </p>
 
 <p align="center">
-  <img src="docs/ui-preview.jpg" alt="Upscaling Pro Studio Interface — 4K Split Slider Preview" width="100%" />
+  <img src="docs/ui-preview.png" alt="Upscaling Pro Studio Interface — 4K Split Slider Preview" width="100%" />
 </p>
 <p align="center">
   <em>Interactive 4K Split Slider comparison with Natural Detail Blending, Downscaling Guard, and Post-Processing Clarity controls.</em>
