@@ -49,7 +49,33 @@ function playCompletionChime() {
   }
 }
 
+async function safeFetchJson(response, fallbackMsg) {
+  const contentType = response.headers.get('content-type') || '';
+  if (contentType.includes('application/json')) {
+    const data = await response.json();
+    if (!response.ok) {
+      throw new Error(data.error || fallbackMsg);
+    }
+    return data;
+  }
+
+  // Handle non-JSON responses (e.g., 404 HTML page on Vercel or proxy disconnection)
+  if (!response.ok) {
+    if (response.status === 404 || window.location.hostname.includes('vercel.app')) {
+      throw new Error(
+        'The AI backend is not available on this static web host. Upscaling Pro requires a local GPU with Vulkan (Real-ESRGAN). To upscale images, clone the repo and run it locally on your PC using "npm run dev".'
+      );
+    }
+    throw new Error(`Server returned error (${response.status}). Please ensure the local backend server is running.`);
+  }
+
+  throw new Error('Received unexpected non-JSON response from server.');
+}
+
 export default function App() {
+  const isHostedPreview = typeof window !== 'undefined' &&
+    !/^(localhost|127\.0\.0\.1|192\.168\.|10\.|172\.)/.test(window.location.hostname);
+
   const [theme, setTheme] = useState(() => {
     const saved = localStorage.getItem('upscaling_theme');
     if (saved === 'light' || saved === 'dark') return saved;
@@ -165,11 +191,7 @@ export default function App() {
     async function pollJob() {
       try {
         const response = await fetch(`/api/jobs/${job.id}`);
-        const data = await response.json();
-
-        if (!response.ok) {
-          throw new Error(data.error || 'Could not read job status.');
-        }
+        const data = await safeFetchJson(response, 'Could not read job status.');
 
         if (!cancelled) {
           setJob((prev) => {
@@ -338,11 +360,7 @@ export default function App() {
         method: 'POST',
         body: formData
       });
-      const data = await response.json();
-
-      if (!response.ok) {
-        throw new Error(data.error || 'Upload request failed.');
-      }
+      const data = await safeFetchJson(response, 'Upload request failed.');
 
       setJob({ id: data.jobId, status: 'queued', message: 'Job queued' });
     } catch (uploadError) {
@@ -711,7 +729,7 @@ export default function App() {
                 <h2>Canvas Preview</h2>
               </div>
 
-              {job?.status === 'done' && upscaledBlobUrl && (
+              {job?.status === 'done' && upscaledBlobUrl ? (
                 <div className="view-toggle-wrap">
                   <button
                     type="button"
@@ -728,7 +746,11 @@ export default function App() {
                     Side by Side
                   </button>
                 </div>
-              )}
+              ) : isHostedPreview ? (
+                <div className="hosted-preview-badge">
+                  UI Preview Mode • Test locally with <code>npm run dev</code>
+                </div>
+              ) : null}
             </div>
 
             {/* Expansive Canvas Viewport */}
@@ -742,6 +764,25 @@ export default function App() {
                   </svg>
                   <h3>No image selected</h3>
                   <p>Upload a photo from the left panel to begin inspection and super-resolution</p>
+                  {isHostedPreview && (
+                    <div className="hosted-demo-notice">
+                      <div className="hosted-demo-title">Local GPU Execution Required</div>
+                      <p className="hosted-demo-desc">
+                        This hosted site is a frontend UI preview. AI super-resolution uses native <strong>Real-ESRGAN Vulkan</strong> binaries on your own GPU. To test upscaling, run the app locally on your computer:
+                      </p>
+                      <div className="hosted-demo-actions">
+                        <code className="hosted-demo-cmd">npm run setup:all &amp;&amp; npm run dev</code>
+                        <a
+                          href="https://github.com/AnaGVF/upscaling-pro"
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="hosted-demo-link"
+                        >
+                          View Setup on GitHub →
+                        </a>
+                      </div>
+                    </div>
+                  )}
                 </div>
               ) : job?.status === 'done' && upscaledBlobUrl ? (
                 compareMode === 'split' ? (
