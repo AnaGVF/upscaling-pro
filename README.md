@@ -21,6 +21,13 @@
   <img src="https://img.shields.io/badge/Privacy-100%25%20Local%20%26%20Private-10B981?style=for-the-badge" alt="100% Local & Private" />
 </p>
 
+<p align="center">
+  <img src="docs/ui-preview.jpg" alt="Upscaling Pro Studio Interface — 4K Split Slider Preview" width="100%" />
+</p>
+<p align="center">
+  <em>Interactive 4K Split Slider comparison with Natural Detail Blending, Downscaling Guard, and Post-Processing Clarity controls.</em>
+</p>
+
 ---
 
 ## 💡 Why Upscaling Pro?
